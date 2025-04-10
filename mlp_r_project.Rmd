@@ -1,0 +1,190 @@
+---
+title: "mlp_r_project"
+output: html_document
+---
+
+Import Libraries
+
+```{r}
+
+library(torch)
+library(data.table)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(caret)
+
+```
+
+### Loading in Data
+
+```{r}
+# Load Data
+df <- fread('synergy_all_playtypes_2015_to_2025.csv')
+            
+head(df)
+
+# select device
+device <- if (torch::cuda_is_available()) {
+  torch_device("cuda")
+} else if (torch::mps_is_available()) {
+  torch_device("mps")
+} else {
+  torch_device("cpu")
+}
+
+```
+
+### Data Cleaning
+
+```{r}
+# Remove unwanted columns
+to_delete <- c('FGA', 'FGM', 'FGX', 'PERCENTILE', 'POSS', 'PTS', 'GP')
+cols_to_delete <- names(df)[sapply(names(df), function(col) any(startsWith(col, to_delete)) & !grepl('PCT', col))]
+cols_to_delete <- c(cols_to_delete, 'PLAYER_ID', 'TEAM_ID', 'TYPE_GROUPING')
+df <- df[, !(names(df) %in% cols_to_delete), with = FALSE]
+
+df[is.na(df)] <- 0
+
+```
+
+### Prep Data for Model
+
+```{r}
+# Prepare training data
+X <- df %>% select(-c(SEASON_ID, PLAYER_NAME, TEAM_ABBREVIATION, TEAM_NAME, SEASON)) %>%
+  mutate(across(everything(), as.numeric)) %>% as.matrix()
+train_index <- createDataPartition(1:nrow(X), p = 0.8, list = FALSE)
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+name_train <- df[train_index, .(PLAYER_NAME, SEASON)]
+name_test <- df[-train_index, .(PLAYER_NAME, SEASON)]
+
+torch_manual_seed(42)
+
+X_train <- as.matrix(X_train)  
+storage.mode(X_train) <- "double" 
+X_test <- as.matrix(X_test)  
+storage.mode(X_test) <- "double" 
+
+X_train[is.na(X_train)] <- 0
+X_test[is.na(X_test)] <- 0
+
+# Convert data to tensors
+X_train_tensor <- torch_tensor(X_train, dtype = torch_float(), device = device)
+X_test_tensor <- torch_tensor(X_test, dtype = torch_float(), device = device)
+
+# create datasets
+dataset_tensor <- dataset(
+  name = "CustomTensorDataset",
+  initialize = function(tensor_data) {
+    self$data <- tensor_data
+  },
+  .getitem = function(index) {
+    self$data[index, ]
+  },
+  .length = function() {
+    self$data$size()[1]
+  }
+)
+
+train_dataset <- dataset_tensor(X_train_tensor)
+test_dataset <- dataset_tensor(X_test_tensor)
+
+train_loader <- dataloader(train_dataset, batch_size = 32, shuffle = TRUE)
+test_loader <- dataloader(test_dataset, batch_size = 32, shuffle = FALSE)
+
+```
+
+### Create Model Class
+
+```{r}
+torch_manual_seed(42)
+
+# auto-encoder class
+AutoEncoder <- nn_module(
+  initialize = function(input_dim, hidden_dim_1, hidden_dim_2, encoding_dim){
+    
+    # create encoder
+    self$encoder <- nn_sequential(
+      nn_linear(input_dim, hidden_dim_1),
+      nn_relu(),
+      nn_linear(hidden_dim_1, hidden_dim_2),
+      nn_relu(),
+      nn_linear(hidden_dim_2, encoding_dim)
+    )
+    self$decoder <- nn_sequential(
+      nn_linear(encoding_dim, hidden_dim_2),
+      nn_relu(),
+      nn_linear(hidden_dim_2, hidden_dim_1),
+      nn_relu(),
+      nn_linear(hidden_dim_1, input_dim),
+      nn_relu()
+    )
+  },
+  # forward pass
+  forward = function(x){
+    x <- self$encoder(x)
+    x <- self$decoder(x)
+    x
+  },
+  
+  # encode function
+  encode = function(x){
+    x <- self$encoder(x)
+    x
+  }
+)
+
+# Training function
+train_autoencoder <- function(model, data_loader, criterion, optimizer, num_epochs) {
+  for (epoch in 1:num_epochs) {
+    coro::loop(for (data in data_loader) {
+      data <- data$to(device = device)
+      optimizer$zero_grad()
+      output <- model$forward(data) 
+      loss <- criterion(output, data)
+      loss$backward()
+      optimizer$step()
+    })
+  }
+}
+
+```
+
+### Set Hyperparameters and Train
+
+```{r}
+# Hyperparameters
+input_dim <- ncol(X_train)
+hidden_dim_1 <- 128
+hidden_dim_2 <- 64
+num_epochs <- 50
+learning_rate <- 1e-4
+
+# Train for different embedding sizes
+for (encoded_dim in 2:4) {
+  model <- AutoEncoder$new(input_dim, hidden_dim_1, hidden_dim_2, encoded_dim)
+  model$to(device = device)
+  criterion <- nn_mse_loss()
+  optimizer <- optim_adam(model$parameters, lr = learning_rate)
+  train_autoencoder(model, train_loader, criterion, optimizer, num_epochs)
+  
+with_no_grad({
+  total_loss <- 0
+  batch_count <- 0
+  
+  coro::loop(for (data in test_loader) {
+    data <- data$to(device = device)
+    output <- model$forward(data)
+    loss <- criterion(output, data)
+    total_loss <- total_loss + loss$item()
+    batch_count <- batch_count + 1
+  })
+  
+  avg_loss <- total_loss / batch_count
+  cat(sprintf("Average Test Loss: %.4f With Embedding Dim: %d\n", avg_loss, encoded_dim))
+})
+
+}
+```
